@@ -43,7 +43,7 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1")
-LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o")
 
 PORT = int(os.environ.get("PORT", "8000"))
 # Render sets RENDER_EXTERNAL_URL automatically; fall back to it if PUBLIC_URL isn't set.
