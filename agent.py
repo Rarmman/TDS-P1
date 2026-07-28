@@ -282,7 +282,12 @@ def call_llm(messages: list, tools_enabled: bool) -> dict:
                 json=payload,
                 timeout=60,
             )
-            resp.raise_for_status()
+            if not resp.ok:
+                # CHANGED: capture the actual response body, not just the
+                # status line -- this is what tells us WHY it's a 400.
+                raise RuntimeError(
+                    f"{resp.status_code} error from {model_name}: {resp.text[:1000]}"
+                )
             data = resp.json()
 
             message = data["choices"][0]["message"]
@@ -291,7 +296,7 @@ def call_llm(messages: list, tools_enabled: bool) -> dict:
 
         except Exception as e:
             last_error = e
-            log_event("llm_call_failed", model=model_name, error=str(e)[-500:])
+            log_event("llm_call_failed", model=model_name, error=str(e)[-1000:])
             continue  # try next model in the chain
 
     # every model in the chain failed
