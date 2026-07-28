@@ -11,10 +11,9 @@ Architecture (per spec):
 Run:
   pip install fastapi uvicorn requests pandas numpy openpyxl beautifulsoup4
   export TELEGRAM_BOT_TOKEN=...
-  export LLM_API_KEY=...
-  export LLM_BASE_URL=https://api.openai.com/v1          # any OpenAI-compatible endpoint
-  export LLM_MODEL=gpt-4o-mini
-  export PUBLIC_URL=https://your-app.up.railway.app       # used for self-ping + log_url
+  export LLM_API_KEY=...              # Gemini API key from aistudio.google.com
+  export LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
+  export PUBLIC_URL=https://your-app.onrender.com   # used for self-ping + log_url
   python agent.py
 """
 
@@ -42,8 +41,24 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1")
-LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o")
+LLM_BASE_URL = os.environ.get(
+    "LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"
+)
+
+# CHANGED: single LLM_MODEL replaced with an ordered fallback chain.
+# Ordered by actual RPD headroom confirmed on the AI Studio Rate Limit
+# dashboard for this project -- NOT by version number. Re-check that
+# dashboard periodically; these numbers can change.
+#   gemini-3.5-flash-lite : 15 RPM / 500 RPD  (best headroom)
+#   gemini-3.1-flash-lite : 15 RPM / 500 RPD  (near-identical backup)
+#   gemini-2.5-flash-lite : 10 RPM /  20 RPD  (thin -- use sparingly)
+#   gemini-2.5-flash      :  5 RPM /  20 RPD  (thinnest -- last resort)
+MODEL_FALLBACK_CHAIN = [
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+]
 
 PORT = int(os.environ.get("PORT", "8000"))
 # Render sets RENDER_EXTERNAL_URL automatically; fall back to it if PUBLIC_URL isn't set.
@@ -239,28 +254,48 @@ Current log URL to use as the placeholder value: {LOG_URL}
 
 # --------------------------------------------------------------------------
 # LLM call (OpenAI-compatible chat completions with function calling)
+# CHANGED: now tries each model in MODEL_FALLBACK_CHAIN in order, moving to
+# the next on any error (rate limit, 404, 5xx, timeout). Logs which model
+# actually served each request so you can check /run.jsonl after grading to
+# see if/when fallbacks fired.
 # --------------------------------------------------------------------------
 
 def call_llm(messages: list, tools_enabled: bool) -> dict:
-    payload = {
-        "model": LLM_MODEL,
-        "messages": messages,
-    }
-    if tools_enabled:
-        payload["tools"] = TOOLS
-        payload["tool_choice"] = "auto"
+    last_error = None
 
-    resp = requests.post(
-        f"{LLM_BASE_URL.rstrip('/')}/chat/completions",
-        headers={
-            "Authorization": f"Bearer {LLM_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=60,
-    )
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]
+    for model_name in MODEL_FALLBACK_CHAIN:
+        payload = {
+            "model": model_name,
+            "messages": messages,
+        }
+        if tools_enabled:
+            payload["tools"] = TOOLS
+            payload["tool_choice"] = "auto"
+
+        try:
+            resp = requests.post(
+                f"{LLM_BASE_URL.rstrip('/')}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {LLM_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=60,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            message = data["choices"][0]["message"]
+            message["_model_used"] = model_name  # tag for logging in agent_loop
+            return message
+
+        except Exception as e:
+            last_error = e
+            log_event("llm_call_failed", model=model_name, error=str(e)[-500:])
+            continue  # try next model in the chain
+
+    # every model in the chain failed
+    raise RuntimeError(f"All models in fallback chain failed. Last error: {last_error}")
 
 
 # --------------------------------------------------------------------------
@@ -282,6 +317,7 @@ def agent_loop(chat_id: int, user_message: str) -> dict:
     push_history(chat_id, "user", user_message)
 
     final_text = None
+    model_used_for_final = None  # CHANGED: track which model produced the final answer
 
     for step in range(MAX_AGENT_STEPS):
         elapsed = time.time() - start_time
@@ -298,6 +334,7 @@ def agent_loop(chat_id: int, user_message: str) -> dict:
             )
 
         message = call_llm(messages, tools_enabled=tools_enabled)
+        model_used_for_final = message.get("_model_used")
         tool_calls = message.get("tool_calls")
 
         if tool_calls and tools_enabled:
@@ -335,6 +372,10 @@ def agent_loop(chat_id: int, user_message: str) -> dict:
 
     answer_json = extract_json_answer(final_text, LOG_URL)
     push_history(chat_id, "assistant", json.dumps(answer_json))
+
+    # CHANGED: record which model actually produced this answer, for debugging
+    log_event("model_used", chat_id=chat_id, model=model_used_for_final)
+
     return answer_json
 
 
@@ -344,11 +385,10 @@ def handle_incoming_message(chat_id: int, question: str) -> dict:
     try:
         answer_json = agent_loop(chat_id, question)
     except Exception:
-        answer_json = {
-            "answer": "internal error",
-            "log_url": LOG_URL,
-            "error": traceback.format_exc()[-2000:],
-        }
+        # FIX (bug 1): don't put the traceback in the reply itself -- it's an
+        # extra key that breaks exact-match grading. Log it instead.
+        log_event("internal_error", chat_id=chat_id, error=traceback.format_exc()[-2000:])
+        answer_json = {"answer": "internal error", "log_url": LOG_URL}
     log_event("final_reply", chat_id=chat_id, reply=answer_json)
     return answer_json
 
@@ -388,7 +428,12 @@ def telegram_poll_loop():
                     continue
 
                 chat_id = message["chat"]["id"]
-                text = message.get("text", "")
+
+                # FIX (bug 2): don't silently drop non-text messages -- the
+                # grader must get a reply to every message, including files.
+                text = message.get("text") or message.get("caption") or ""
+                if not text and "document" in message:
+                    text = f"[User sent a file: {message['document'].get('file_name', 'unknown')}]"
                 if not text:
                     continue
 
