@@ -424,7 +424,9 @@ def telegram_send_message(chat_id: int, text: str):
 
 def telegram_poll_loop():
     """Background thread: Telegram getUpdates long-poll loop."""
+    print(f"[telegram_poll_loop] starting, bot token prefix: {TELEGRAM_BOT_TOKEN[:8]}...", flush=True)
     offset = None
+    loop_count = 0
     while True:
         try:
             params = {"timeout": 30}
@@ -434,6 +436,18 @@ def telegram_poll_loop():
             resp = requests.get(f"{TELEGRAM_API}/getUpdates", params=params, timeout=40)
             resp.raise_for_status()
             data = resp.json()
+
+            loop_count += 1
+            if loop_count % 5 == 0:
+                # CHANGED: periodic heartbeat so Render logs show this loop is alive,
+                # not just silent until something goes wrong.
+                print(f"[telegram_poll_loop] heartbeat #{loop_count}, ok={data.get('ok')}", flush=True)
+
+            if not data.get("ok"):
+                # CHANGED: surface Telegram API-level errors explicitly (e.g. 409
+                # Conflict from a webhook being set, or an invalid token) instead
+                # of silently doing nothing.
+                print(f"[telegram_poll_loop] Telegram API returned not-ok: {data}", flush=True)
 
             for update in data.get("result", []):
                 offset = update["update_id"] + 1
@@ -451,10 +465,12 @@ def telegram_poll_loop():
                 if not text:
                     continue
 
+                print(f"[telegram_poll_loop] received message from chat {chat_id}: {text[:80]!r}", flush=True)
                 answer_json = handle_incoming_message(chat_id, text)
                 telegram_send_message(chat_id, json.dumps(answer_json))
 
-        except Exception:
+        except Exception as e:
+            print(f"[telegram_poll_loop] EXCEPTION: {e}", flush=True)
             traceback.print_exc()
             time.sleep(5)
 
@@ -488,6 +504,44 @@ def health():
         "llm_base_url": LLM_BASE_URL,
         "model_fallback_chain": MODEL_FALLBACK_CHAIN,
     }
+
+
+@app.get("/debug-llm")
+def debug_llm():
+    """
+    TEMPORARY DEBUG ENDPOINT -- remove before final submission.
+    Makes one raw test call to the first model in the fallback chain,
+    from inside the running Render container, and returns exactly what
+    Google's API said. This tests auth/network from Render's own network
+    without needing shell access.
+    """
+    model_name = MODEL_FALLBACK_CHAIN[0]
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    try:
+        resp = requests.post(
+            f"{LLM_BASE_URL.rstrip('/')}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {LLM_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=30,
+        )
+        return {
+            "model_tried": model_name,
+            "status_code": resp.status_code,
+            "response_body": resp.text[:2000],
+            "key_fingerprint": _mask_key(LLM_API_KEY),
+        }
+    except Exception as e:
+        return {
+            "model_tried": model_name,
+            "error": str(e)[:2000],
+            "key_fingerprint": _mask_key(LLM_API_KEY),
+        }
 
 
 @app.get("/run.jsonl")
