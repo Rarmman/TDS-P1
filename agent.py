@@ -492,6 +492,19 @@ def self_ping_loop():
 
 app = FastAPI()
 
+# CRITICAL FIX: Render's start command is `uvicorn agent:app ...`, which
+# imports this file as a module and grabs `app` -- it never executes the
+# `if __name__ == "__main__":` block below. That block used to be the ONLY
+# place these background threads were started, so on Render they never
+# started at all: the FastAPI endpoints worked fine (uvicorn serves `app`
+# directly) but Telegram polling and the self-ping never ran.
+#
+# Starting them here, at module import time, means they launch correctly
+# both when run locally via `python agent.py` AND when deployed via
+# `uvicorn agent:app ...`.
+threading.Thread(target=telegram_poll_loop, daemon=True).start()
+threading.Thread(target=self_ping_loop, daemon=True).start()
+
 
 @app.get("/health")
 def health():
@@ -559,8 +572,11 @@ def get_run_log():
 # --------------------------------------------------------------------------
 
 def main():
-    threading.Thread(target=telegram_poll_loop, daemon=True).start()
-    threading.Thread(target=self_ping_loop, daemon=True).start()
+    # NOTE: telegram_poll_loop and self_ping_loop are already started above,
+    # at module import time -- that's what makes them run under Render's
+    # `uvicorn agent:app` start command. Do NOT start them again here, or a
+    # local `python agent.py` run would spawn each loop twice (double
+    # Telegram polling -> duplicate replies to every message).
     uvicorn.run(app, host="0.0.0.0", port=PORT)
 
 
