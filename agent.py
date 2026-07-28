@@ -75,6 +75,15 @@ WALL_CLOCK_BUDGET_SECONDS = 210
 HISTORY_TURNS_PER_CHAT = 20
 SELF_PING_INTERVAL_SECONDS = 10 * 60  # 10 min
 
+
+def _mask_key(key: str) -> str:
+    """Return a safe-to-log fingerprint of a secret: length + first/last 4 chars only."""
+    if not key:
+        return "EMPTY"
+    if len(key) <= 8:
+        return f"len={len(key)} (too short to fingerprint safely)"
+    return f"len={len(key)} starts={key[:4]}... ends=...{key[-4:]}"
+
 # --------------------------------------------------------------------------
 # Logging (JSONL) -- doubles as public log and debugging tool
 # --------------------------------------------------------------------------
@@ -470,7 +479,15 @@ app = FastAPI()
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "ts": datetime.now(timezone.utc).isoformat()}
+    return {
+        "status": "ok",
+        "ts": datetime.now(timezone.utc).isoformat(),
+        # TEMPORARY DEBUG FIELDS -- remove before final submission.
+        # Never logs/exposes the actual key, only length + first/last 4 chars.
+        "llm_api_key_fingerprint": _mask_key(LLM_API_KEY),
+        "llm_base_url": LLM_BASE_URL,
+        "model_fallback_chain": MODEL_FALLBACK_CHAIN,
+    }
 
 
 @app.get("/run.jsonl")
